@@ -48,20 +48,15 @@ def init_processed_table():
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
         
-        # Create processed table (same structure as launches_v2)
+        # Create processed table with only the columns we actually use
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS launches_v2_processed (
                 launch_key TEXT PRIMARY KEY,
-                payload_sha256 TEXT,
-                created_at TIMESTAMPTZ,
                 processed_at TIMESTAMPTZ DEFAULT NOW(),
                 campaign_id TEXT,
                 adset_id TEXT,
                 creative_id TEXT,
                 ad_id TEXT,
-                campaign_name TEXT,
-                adset_name TEXT,
-                product TEXT,
                 ad_name TEXT,
                 webhook_status TEXT
             )
@@ -101,16 +96,14 @@ def get_unprocessed_ads(limit: int = 100) -> List[Dict]:
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
         # Get ads from launches_v2 that aren't in processed table
+        # Only select columns that definitely exist
         cursor.execute("""
             SELECT 
                 l.launch_key,
                 l.campaign_id,
                 l.adset_id,
                 l.creative_id,
-                l.ad_id,
-                l.adset_name,
-                l.campaign_name,
-                l.product
+                l.ad_id
             FROM launches_v2 l
             LEFT JOIN launches_v2_processed p ON l.launch_key = p.launch_key
             WHERE p.launch_key IS NULL
@@ -165,7 +158,7 @@ def mark_as_processed(ads_with_names: List[Dict], status: str = 'success'):
     """Move ads from launches_v2 to launches_v2_processed.
     
     Args:
-        ads_with_names: List of dicts with 'launch_key' and 'ad_name'
+        ads_with_names: List of dicts with 'launch_key', 'ad_name', 'campaign_id', 'adset_id', 'creative_id', 'ad_id'
         status: 'success' or 'failed'
     """
     if not ads_with_names:
@@ -176,18 +169,22 @@ def mark_as_processed(ads_with_names: List[Dict], status: str = 'success'):
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
         
-        # Copy to processed table with ad_name
+        # Insert into processed table
         for ad in ads_with_names:
             cursor.execute("""
                 INSERT INTO launches_v2_processed 
-                    (launch_key, payload_sha256, created_at, campaign_id, adset_id, 
-                     creative_id, ad_id, campaign_name, adset_name, product, ad_name, webhook_status)
-                SELECT 
-                    launch_key, payload_sha256, created_at, campaign_id, adset_id,
-                    creative_id, ad_id, campaign_name, adset_name, product, %s, %s
-                FROM launches_v2
-                WHERE launch_key = %s
-            """, (ad['ad_name'], status, ad['launch_key']))
+                    (launch_key, campaign_id, adset_id, creative_id, ad_id, ad_name, webhook_status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (launch_key) DO NOTHING
+            """, (
+                ad['launch_key'],
+                ad.get('campaign_id'),
+                ad.get('adset_id'),
+                ad.get('creative_id'),
+                ad.get('ad_id'),
+                ad['ad_name'],
+                status
+            ))
         
         # Delete from original table
         launch_keys = [ad['launch_key'] for ad in ads_with_names]
@@ -224,8 +221,7 @@ def send_to_webhook(ads: List[Dict]) -> tuple[bool, List[Dict]]:
                 "ad_name": "3815_0_Rosa Glanz",
                 "ad_id": "120239779109310430",
                 "adset_id": "120239779108750430",
-                "campaign_id": "120236472829790430",
-                "product": "rosa"
+                "campaign_id": "120236472829790430"
             },
             ...
         ]
@@ -252,13 +248,16 @@ def send_to_webhook(ads: List[Dict]) -> tuple[bool, List[Dict]]:
                 "ad_id": ad['ad_id'],
                 "adset_id": ad['adset_id'],
                 "campaign_id": ad['campaign_id'],
-                "product": ad.get('product', ''),
             }
             
             ads_data.append(ad_info)
             ads_with_names.append({
                 'launch_key': ad['launch_key'],
-                'ad_name': ad_name
+                'ad_name': ad_name,
+                'campaign_id': ad['campaign_id'],
+                'adset_id': ad['adset_id'],
+                'creative_id': ad['creative_id'],
+                'ad_id': ad['ad_id'],
             })
         
         if not ads_data:
