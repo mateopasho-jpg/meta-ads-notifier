@@ -1,0 +1,12 @@
+# Database Configuration
+DATABASE_URL=postgresql://user:password@host:5432/database
+
+# Make.com Webhook URL
+MAKE_WEBHOOK_URL=https://hook.eu1.make.com/your-webhook-id-here
+
+# Meta API Access Token (with ads_read permission)
+META_ACCESS_TOKEN=EAAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# Optional: Polling Configuration
+POLL_INTERVAL_SECONDS=60
+BATCH_SIZE=100
