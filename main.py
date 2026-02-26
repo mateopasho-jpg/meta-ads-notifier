@@ -331,7 +331,7 @@ def send_to_webhook(ads: List[Dict]) -> tuple[bool, List[Dict]]:
         "count": 4,
         "ads": [
             {
-                "ad_name": "3815_0_Rosa Glanz",
+                "ad_name": "3830_0_Rosa Glanz",  // Clean name for Notion matching
                 "ad_id": "120239779109310430",
                 "adset_id": "120239779108750430",
                 "campaign_id": "120236472829790430"
@@ -349,15 +349,19 @@ def send_to_webhook(ads: List[Dict]) -> tuple[bool, List[Dict]]:
         
         for ad in ads:
             # Try to get ad name from Meta API
-            ad_name = get_ad_name_from_meta_api(ad['ad_id'])
+            ad_name_full = get_ad_name_from_meta_api(ad['ad_id'])
             
             # If API call failed, skip this ad for now
-            if ad_name is None:
+            if ad_name_full is None:
                 logging.warning(f"⚠️  Skipping ad {ad['ad_id']} - couldn't fetch name")
                 continue
             
+            # Extract clean name (before first " //")
+            # Example: "3830_0_Rosa Glanz // Video // Mehr dazu // LP260" -> "3830_0_Rosa Glanz"
+            ad_name_clean = ad_name_full.split(" //")[0].strip() if " //" in ad_name_full else ad_name_full
+            
             ad_info = {
-                "ad_name": ad_name,
+                "ad_name": ad_name_clean,  # Clean name for Notion matching
                 "ad_id": ad['ad_id'],
                 "adset_id": ad['adset_id'],
                 "campaign_id": ad['campaign_id'],
@@ -366,7 +370,7 @@ def send_to_webhook(ads: List[Dict]) -> tuple[bool, List[Dict]]:
             ads_data.append(ad_info)
             ads_with_names.append({
                 'launch_key': ad['launch_key'],
-                'ad_name': ad_name,
+                'ad_name': ad_name_full,  # Store full name in database
                 'campaign_id': ad['campaign_id'],
                 'adset_id': ad['adset_id'],
                 'creative_id': ad['creative_id'],
