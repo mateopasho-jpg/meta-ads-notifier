@@ -4,10 +4,16 @@ Meta Ads ID Notifier - Standalone Service
 ==========================================
 
 Standalone service that:
-1. Reads new entries from launches_v2 table
-2. Extracts ad name, ad_id, adset_id, campaign_id
+1. Reads entries from launches_v2 table (polling)
+2. Fetches ad name via Meta API
 3. Sends to Make.com webhook
-4. Moves processed entries to launches_v2_processed table
+4. Records attempt result in launches_v2_processed (UPSERT)
+
+IMPORTANT BEHAVIOR (new):
+- We do NOT filter launches_v2 by launches_v2_processed anymore.
+- That means every poll will send the selected launches_v2 rows to the webhook,
+  even if they were previously sent.
+- launches_v2_processed becomes a "last attempt status" table.
 
 Deploy as independent Railway service.
 """
@@ -17,40 +23,56 @@ import sys
 import time
 import logging
 from datetime import datetime, timezone
-from typing import List, Dict
+from typing import List, Dict, Tuple, Optional
+
 import requests
 
-# Configure logging
+
+# -----------------------------
+# Logging
+# -----------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s',
-    stream=sys.stdout
+    format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stdout,
 )
+
 
 # -----------------------------
 # Configuration
 # -----------------------------
+DATABASE_URL = os.getenv("DATABASE_URL")  # PostgreSQL connection
+WEBHOOK_URL = os.getenv("MAKE_WEBHOOK_URL")  # Make.com webhook
+META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")  # Meta API token
 
-DATABASE_URL = os.getenv('DATABASE_URL')  # PostgreSQL connection
-WEBHOOK_URL = os.getenv('MAKE_WEBHOOK_URL')  # Make.com webhook
-META_ACCESS_TOKEN = os.getenv('META_ACCESS_TOKEN')  # Meta API token
-POLL_INTERVAL = int(os.getenv('POLL_INTERVAL_SECONDS', '60'))  # 60 seconds
-BATCH_SIZE = int(os.getenv('BATCH_SIZE', '100'))  # Process 100 at a time
-RETRY_FAILED_AFTER_MINUTES = int(os.getenv('RETRY_FAILED_AFTER_MINUTES', '5'))  # Retry failed ads after 5 minutes
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))  # 60 seconds
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))  # Process 100 at a time
+
+# Retry failed attempts (still supported)
+RETRY_FAILED_AFTER_MINUTES = int(os.getenv("RETRY_FAILED_AFTER_MINUTES", "5"))
+
+# Optional: if you want to only send the most recent N minutes each run,
+# set RECENT_WINDOW_MINUTES. If unset/empty, we do not time-filter.
+# Example: RECENT_WINDOW_MINUTES=10
+RECENT_WINDOW_MINUTES = os.getenv("RECENT_WINDOW_MINUTES")
+RECENT_WINDOW_MINUTES_INT: Optional[int] = (
+    int(RECENT_WINDOW_MINUTES) if RECENT_WINDOW_MINUTES and RECENT_WINDOW_MINUTES.strip() else None
+)
+
 
 # -----------------------------
 # Database Setup
 # -----------------------------
-
 def init_processed_table():
     """Create the processed table if it doesn't exist."""
     try:
         import psycopg2
+
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
-        
-        # Create processed table with only the columns we actually use
-        cursor.execute("""
+
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS launches_v2_processed (
                 launch_key TEXT PRIMARY KEY,
                 processed_at TIMESTAMPTZ DEFAULT NOW(),
@@ -61,20 +83,22 @@ def init_processed_table():
                 ad_name TEXT,
                 webhook_status TEXT
             )
-        """)
-        
-        # Create index for faster lookups
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_processed_at 
+        """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_processed_at
             ON launches_v2_processed(processed_at DESC)
-        """)
-        
+        """
+        )
+
         conn.commit()
         cursor.close()
         conn.close()
-        
+
         logging.info("✅ Processed table initialized")
-        
+
     except Exception as e:
         logging.error(f"Failed to initialize processed table: {e}")
         raise
@@ -83,94 +107,76 @@ def init_processed_table():
 # -----------------------------
 # Database Operations
 # -----------------------------
-
-def get_unprocessed_ads(limit: int = 100) -> List[Dict]:
-    """Get unprocessed ads from launches_v2.
-    
-    Returns ads that are NOT in launches_v2_processed yet.
+def get_ads_from_launches_v2(limit: int = 100) -> List[Dict]:
+    """
+    Get ads from launches_v2 (NO processed-filtering).
+    This is the core change: we poll the "current truth" and send every run.
     """
     try:
         import psycopg2
         import psycopg2.extras
-        
+
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        
-        # Get ads from launches_v2 that aren't in processed table
-        # Only select columns that definitely exist
-        cursor.execute("""
-            SELECT 
-                l.launch_key,
-                l.campaign_id,
-                l.adset_id,
-                l.creative_id,
-                l.ad_id
-            FROM launches_v2 l
-            LEFT JOIN launches_v2_processed p ON l.launch_key = p.launch_key
-            WHERE p.launch_key IS NULL
-            ORDER BY l.created_at ASC
-            LIMIT %s
-        """, (limit,))
-        
+
+        if RECENT_WINDOW_MINUTES_INT is not None:
+            cursor.execute(
+                """
+                SELECT
+                    l.launch_key,
+                    l.campaign_id,
+                    l.adset_id,
+                    l.creative_id,
+                    l.ad_id
+                FROM launches_v2 l
+                WHERE l.created_at > NOW() - (%s * INTERVAL '1 minute')
+                ORDER BY l.created_at DESC
+                LIMIT %s
+                """,
+                (RECENT_WINDOW_MINUTES_INT, limit),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT
+                    l.launch_key,
+                    l.campaign_id,
+                    l.adset_id,
+                    l.creative_id,
+                    l.ad_id
+                FROM launches_v2 l
+                ORDER BY l.created_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
-        
+
         return [dict(row) for row in rows]
-        
+
     except Exception as e:
-        logging.error(f"Failed to get unprocessed ads: {e}")
+        logging.error(f"Failed to get ads from launches_v2: {e}")
         return []
 
 
-def get_ad_name_from_meta_api(ad_id: str) -> str:
-    """Fetch ad name directly from Meta API.
-    
-    The ad name format should be: 3815_0_Rosa Glanz
-    """
-    try:
-        if not META_ACCESS_TOKEN:
-            logging.warning("META_ACCESS_TOKEN not set, cannot fetch ad name from API")
-            return None
-        
-        url = f"https://graph.facebook.com/v21.0/{ad_id}"
-        params = {
-            'fields': 'name',
-            'access_token': META_ACCESS_TOKEN
-        }
-        
-        response = requests.get(url, params=params, timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json()
-            ad_name = data.get('name', '')
-            logging.info(f"  Fetched ad name for {ad_id}: '{ad_name}'")
-            return ad_name
-        else:
-            logging.warning(f"Failed to fetch ad name for {ad_id}: {response.status_code} - {response.text[:200]}")
-            return None
-            
-    except Exception as e:
-        logging.warning(f"Error fetching ad name from Meta API: {e}")
-        return None
-
-
 def get_failed_ads_to_retry(retry_after_minutes: int) -> List[Dict]:
-    """Get failed ads that are old enough to retry.
-    
-    Returns ads that failed more than retry_after_minutes ago.
+    """
+    Get failed ads that are old enough to retry.
+    NOTE: query fixed to use a safe interval expression.
     """
     try:
         import psycopg2
         import psycopg2.extras
-        from datetime import timedelta
-        
+
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        
-        # Get failed ads that are older than retry threshold
-        cursor.execute("""
-            SELECT 
+
+        cursor.execute(
+            """
+            SELECT
                 launch_key,
                 campaign_id,
                 adset_id,
@@ -180,233 +186,188 @@ def get_failed_ads_to_retry(retry_after_minutes: int) -> List[Dict]:
                 processed_at
             FROM launches_v2_processed
             WHERE webhook_status = 'failed'
-            AND processed_at < NOW() - INTERVAL '%s minutes'
+              AND processed_at < NOW() - (%s * INTERVAL '1 minute')
             ORDER BY processed_at ASC
             LIMIT 100
-        """, (retry_after_minutes,))
-        
+            """,
+            (retry_after_minutes,),
+        )
+
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
-        
+
         return [dict(row) for row in rows]
-        
+
     except Exception as e:
         logging.error(f"Failed to get failed ads: {e}")
         return []
 
 
-def retry_failed_ads(ads: List[Dict]) -> bool:
-    """Retry sending failed ads to webhook.
-    
-    Returns True if successful, False otherwise.
-    """
+# -----------------------------
+# Meta API
+# -----------------------------
+def get_ad_name_from_meta_api(ad_id: str) -> Optional[str]:
+    """Fetch ad name directly from Meta API."""
     try:
-        if not ads:
-            return False
-        
-        # Prepare payload with cleaned ad names
-        ads_data = []
-        for ad in ads:
-            # Clean the ad name (remove " // Video // Mehr dazu // LPXXX" part)
-            ad_name_full = ad['ad_name']
-            ad_name_clean = ad_name_full.split(" //")[0].strip() if " //" in ad_name_full else ad_name_full
-            
-            ads_data.append({
-                "ad_name": ad_name_clean,  # Send clean name for Notion matching
-                "ad_id": ad['ad_id'],
-                "adset_id": ad['adset_id'],
-                "campaign_id": ad['campaign_id'],
-            })
-        
-        payload = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "count": len(ads_data),
-            "ads": ads_data,
-            "retry": True  # Flag to indicate this is a retry
-        }
-        
-        logging.info(f"🔄 Retrying {len(ads_data)} failed ad(s)...")
-        
-        response = requests.post(
-            WEBHOOK_URL,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=30
+        if not META_ACCESS_TOKEN:
+            logging.warning("META_ACCESS_TOKEN not set, cannot fetch ad name from API")
+            return None
+
+        url = f"https://graph.facebook.com/v21.0/{ad_id}"
+        params = {"fields": "name", "access_token": META_ACCESS_TOKEN}
+
+        response = requests.get(url, params=params, timeout=10)
+
+        if response.status_code == 200:
+            data = response.json()
+            ad_name = data.get("name", "")
+            logging.info(f"  Fetched ad name for {ad_id}: '{ad_name}'")
+            return ad_name
+
+        logging.warning(
+            f"Failed to fetch ad name for {ad_id}: {response.status_code} - {response.text[:200]}"
         )
-        
-        if 200 <= response.status_code < 300:
-            logging.info(f"✅ Retry successful (status {response.status_code})")
-            
-            # Update status to success
-            try:
-                import psycopg2
-                conn = psycopg2.connect(DATABASE_URL)
-                cursor = conn.cursor()
-                
-                launch_keys = [ad['launch_key'] for ad in ads]
-                cursor.execute("""
-                    UPDATE launches_v2_processed
-                    SET webhook_status = 'success',
-                        processed_at = NOW()
-                    WHERE launch_key = ANY(%s)
-                """, (launch_keys,))
-                
-                conn.commit()
-                cursor.close()
-                conn.close()
-                
-                logging.info(f"✅ Updated {len(ads)} ad(s) to success status")
-                
-            except Exception as e:
-                logging.error(f"Failed to update retry status: {e}")
-            
-            return True
-        else:
-            logging.error(f"❌ Retry failed with status {response.status_code}: {response.text[:200]}")
-            return False
-            
+        return None
+
     except Exception as e:
-        logging.error(f"❌ Failed to retry: {e}")
-        return False
+        logging.warning(f"Error fetching ad name from Meta API: {e}")
+        return None
 
 
-def mark_as_processed(ads_with_names: List[Dict], status: str = 'success'):
-    """Move ads from launches_v2 to launches_v2_processed.
-    
-    Args:
-        ads_with_names: List of dicts with 'launch_key', 'ad_name', 'campaign_id', 'adset_id', 'creative_id', 'ad_id'
-        status: 'success' or 'failed'
+# -----------------------------
+# Processed table write (UPSERT)
+# -----------------------------
+def upsert_processed_rows(ads_with_names: List[Dict], status: str):
+    """
+    UPSERT into launches_v2_processed:
+    - insert if missing
+    - otherwise update existing row (status, processed_at, and ids/names)
     """
     if not ads_with_names:
         return
-        
+
     try:
         import psycopg2
+
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
-        
-        # Insert into processed table
+
         for ad in ads_with_names:
-            cursor.execute("""
-                INSERT INTO launches_v2_processed 
-                    (launch_key, campaign_id, adset_id, creative_id, ad_id, ad_name, webhook_status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (launch_key) DO NOTHING
-            """, (
-                ad['launch_key'],
-                ad.get('campaign_id'),
-                ad.get('adset_id'),
-                ad.get('creative_id'),
-                ad.get('ad_id'),
-                ad['ad_name'],
-                status
-            ))
-        
-        # Delete from original table
-        launch_keys = [ad['launch_key'] for ad in ads_with_names]
-        cursor.execute("""
-            DELETE FROM launches_v2
-            WHERE launch_key = ANY(%s)
-        """, (launch_keys,))
-        
+            cursor.execute(
+                """
+                INSERT INTO launches_v2_processed
+                    (launch_key, campaign_id, adset_id, creative_id, ad_id, ad_name, webhook_status, processed_at)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (launch_key) DO UPDATE SET
+                    campaign_id    = EXCLUDED.campaign_id,
+                    adset_id       = EXCLUDED.adset_id,
+                    creative_id    = EXCLUDED.creative_id,
+                    ad_id          = EXCLUDED.ad_id,
+                    ad_name        = EXCLUDED.ad_name,
+                    webhook_status = EXCLUDED.webhook_status,
+                    processed_at   = NOW()
+                """,
+                (
+                    ad["launch_key"],
+                    ad.get("campaign_id"),
+                    ad.get("adset_id"),
+                    ad.get("creative_id"),
+                    ad.get("ad_id"),
+                    ad.get("ad_name"),
+                    status,
+                ),
+            )
+
         conn.commit()
         cursor.close()
         conn.close()
-        
-        logging.info(f"✅ Marked {len(ads_with_names)} ad(s) as processed (status: {status})")
-        
+
+        logging.info(f"✅ Upserted {len(ads_with_names)} row(s) to processed (status: {status})")
+
     except Exception as e:
-        logging.error(f"Failed to mark ads as processed: {e}")
+        logging.error(f"Failed to upsert processed rows: {e}")
 
 
 # -----------------------------
 # Webhook Sender
 # -----------------------------
+def send_to_webhook(ads: List[Dict], retry: bool = False) -> Tuple[bool, List[Dict]]:
+    """
+    Send ads to Make.com webhook.
 
-def send_to_webhook(ads: List[Dict]) -> tuple[bool, List[Dict]]:
-    """Send ads to Make.com webhook.
-    
-    Returns: (success, ads_with_names)
-    
-    Payload format:
-    {
-        "timestamp": "2026-02-25T16:00:00Z",
-        "count": 4,
-        "ads": [
-            {
-                "ad_name": "3830_0_Rosa Glanz",  // Clean name for Notion matching
-                "ad_id": "120239779109310430",
-                "adset_id": "120239779108750430",
-                "campaign_id": "120236472829790430"
-            },
-            ...
-        ]
-    }
+    Returns: (success, ads_with_names_for_db)
+
+    We always try to fetch ad names and send clean names to Notion matching.
     """
     try:
-        # Prepare payload
         ads_data = []
         ads_with_names = []
-        
+
         logging.info(f"Fetching ad names from Meta API for {len(ads)} ad(s)...")
-        
+
         for ad in ads:
-            # Try to get ad name from Meta API
-            ad_name_full = get_ad_name_from_meta_api(ad['ad_id'])
-            
-            # If API call failed, skip this ad for now
-            if ad_name_full is None:
-                logging.warning(f"⚠️  Skipping ad {ad['ad_id']} - couldn't fetch name")
+            ad_id = ad.get("ad_id")
+            if not ad_id:
+                logging.warning("⚠️  Skipping row with missing ad_id")
                 continue
-            
-            # Extract clean name (before first " //")
-            # Example: "3830_0_Rosa Glanz // Video // Mehr dazu // LP260" -> "3830_0_Rosa Glanz"
+
+            ad_name_full = get_ad_name_from_meta_api(ad_id)
+            if ad_name_full is None:
+                logging.warning(f"⚠️  Skipping ad {ad_id} - couldn't fetch name")
+                continue
+
+            # Clean name for Notion matching
             ad_name_clean = ad_name_full.split(" //")[0].strip() if " //" in ad_name_full else ad_name_full
-            
-            ad_info = {
-                "ad_name": ad_name_clean,  # Clean name for Notion matching
-                "ad_id": ad['ad_id'],
-                "adset_id": ad['adset_id'],
-                "campaign_id": ad['campaign_id'],
-            }
-            
-            ads_data.append(ad_info)
-            ads_with_names.append({
-                'launch_key': ad['launch_key'],
-                'ad_name': ad_name_full,  # Store full name in database
-                'campaign_id': ad['campaign_id'],
-                'adset_id': ad['adset_id'],
-                'creative_id': ad['creative_id'],
-                'ad_id': ad['ad_id'],
-            })
-        
+
+            ads_data.append(
+                {
+                    "ad_name": ad_name_clean,
+                    "ad_id": ad.get("ad_id"),
+                    "adset_id": ad.get("adset_id"),
+                    "campaign_id": ad.get("campaign_id"),
+                }
+            )
+
+            ads_with_names.append(
+                {
+                    "launch_key": ad.get("launch_key"),
+                    "ad_name": ad_name_full,  # store full name in DB
+                    "campaign_id": ad.get("campaign_id"),
+                    "adset_id": ad.get("adset_id"),
+                    "creative_id": ad.get("creative_id"),
+                    "ad_id": ad.get("ad_id"),
+                }
+            )
+
         if not ads_data:
-            logging.warning("❌ No ads to send (all failed to fetch names)")
+            logging.warning("❌ No ads to send (all failed to fetch names or missing ad_id)")
             return False, []
-        
+
         payload = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "count": len(ads_data),
-            "ads": ads_data
+            "ads": ads_data,
         }
-        
+        if retry:
+            payload["retry"] = True
+
         logging.info(f"📤 Sending {len(ads_data)} ad(s) to webhook...")
-        
         response = requests.post(
             WEBHOOK_URL,
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=30
+            timeout=30,
         )
-        
+
         if 200 <= response.status_code < 300:
             logging.info(f"✅ Successfully sent to webhook (status {response.status_code})")
             return True, ads_with_names
-        else:
-            logging.error(f"❌ Webhook failed with status {response.status_code}: {response.text[:200]}")
-            return False, ads_with_names
-            
+
+        logging.error(f"❌ Webhook failed with status {response.status_code}: {response.text[:200]}")
+        return False, ads_with_names
+
     except Exception as e:
         logging.error(f"❌ Failed to send to webhook: {e}")
         return False, []
@@ -415,81 +376,69 @@ def send_to_webhook(ads: List[Dict]) -> tuple[bool, List[Dict]]:
 # -----------------------------
 # Main Loop
 # -----------------------------
-
 def main():
-    """Main service loop."""
-    
     # Validate config
     if not DATABASE_URL:
         logging.error("❌ DATABASE_URL not set. Exiting.")
         sys.exit(1)
-    
+
     if not WEBHOOK_URL:
         logging.error("❌ MAKE_WEBHOOK_URL not set. Exiting.")
         sys.exit(1)
-    
+
     if not META_ACCESS_TOKEN:
         logging.error("❌ META_ACCESS_TOKEN not set. Exiting.")
         sys.exit(1)
-    
+
     logging.info("=" * 70)
     logging.info("🚀 Meta Ads ID Notifier - Starting")
     logging.info("=" * 70)
-    logging.info(f"📊 Database: Connected")
+    logging.info("📊 Database: Connected")
     logging.info(f"🔗 Webhook: {WEBHOOK_URL[:50]}...")
-    logging.info(f"🔑 Meta Token: {'*' * 20}{META_ACCESS_TOKEN[-10:]}")
+    logging.info(f"🔑 Meta Token: {'*' * 20}{META_ACCESS_TOKEN[-12:]}")
     logging.info(f"⏱️  Poll interval: {POLL_INTERVAL}s")
     logging.info(f"📦 Batch size: {BATCH_SIZE}")
     logging.info(f"🔄 Retry failed after: {RETRY_FAILED_AFTER_MINUTES} minutes")
+    if RECENT_WINDOW_MINUTES_INT is not None:
+        logging.info(f"🕒 Recent window: last {RECENT_WINDOW_MINUTES_INT} minute(s)")
+    else:
+        logging.info("🕒 Recent window: disabled (will resend latest rows each poll)")
+
     logging.info("=" * 70)
-    
-    # Initialize processed table
+
     init_processed_table()
-    
-    # Track cycles for retry logic (retry every 5 cycles = 5 minutes with 60s poll)
-    cycle_count = 0
-    
-    # Main loop
+
     while True:
         try:
-            cycle_count += 1
-            
-            # Every 5 minutes (5 cycles), check for failed ads to retry
-            if cycle_count % 5 == 0:
-                failed_ads = get_failed_ads_to_retry(RETRY_FAILED_AFTER_MINUTES)
-                if failed_ads:
-                    logging.info(f"\n🔄 Found {len(failed_ads)} failed ad(s) to retry")
-                    retry_failed_ads(failed_ads)
-            
-            # Get unprocessed ads
-            ads = get_unprocessed_ads(limit=BATCH_SIZE)
-            
-            if ads:
-                logging.info(f"\n🔍 Found {len(ads)} unprocessed ad(s)")
-                
-                # Send to webhook (also fetches ad names)
-                success, ads_with_names = send_to_webhook(ads)
-                
-                # Mark as processed
-                if ads_with_names:
-                    status = 'success' if success else 'failed'
-                    mark_as_processed(ads_with_names, status)
-                else:
-                    logging.warning("⚠️  No ads were successfully processed this cycle")
-                
-            else:
-                logging.info("✨ No new ads to process")
-            
+            # 1) Retry failures (optional)
+            failed = get_failed_ads_to_retry(RETRY_FAILED_AFTER_MINUTES)
+            if failed:
+                logging.info(f"🔄 Found {len(failed)} failed ad(s) to retry")
+                ok, ads_with_names = send_to_webhook(failed, retry=True)
+                upsert_processed_rows(ads_with_names, "success" if ok else "failed")
+
+            # 2) Poll launches_v2 (NO processed filtering)
+            ads = get_ads_from_launches_v2(BATCH_SIZE)
+
+            if not ads:
+                logging.info("✨ No ads found in launches_v2 to process")
+                logging.info(f"💤 Sleeping {POLL_INTERVAL}s until next poll...")
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            ok, ads_with_names = send_to_webhook(ads, retry=False)
+            upsert_processed_rows(ads_with_names, "success" if ok else "failed")
+
+            logging.info(f"💤 Sleeping {POLL_INTERVAL}s until next poll...")
+            time.sleep(POLL_INTERVAL)
+
         except KeyboardInterrupt:
-            logging.info("\n👋 Shutting down gracefully...")
-            break
-            
+            logging.info("👋 Shutting down...")
+            sys.exit(0)
         except Exception as e:
-            logging.error(f"❌ Error in main loop: {e}", exc_info=True)
-        
-        # Sleep until next poll
-        logging.info(f"💤 Sleeping {POLL_INTERVAL}s until next poll...\n")
-        time.sleep(POLL_INTERVAL)
+            logging.error(f"❌ Unexpected error in main loop: {e}")
+            logging.info(f"💤 Sleeping {POLL_INTERVAL}s until next poll...")
+            time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
