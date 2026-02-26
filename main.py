@@ -205,11 +205,15 @@ def retry_failed_ads(ads: List[Dict]) -> bool:
         if not ads:
             return False
         
-        # Prepare payload (ad_name already fetched previously)
+        # Prepare payload with cleaned ad names
         ads_data = []
         for ad in ads:
+            # Clean the ad name (remove " // Video // Mehr dazu // LPXXX" part)
+            ad_name_full = ad['ad_name']
+            ad_name_clean = ad_name_full.split(" //")[0].strip() if " //" in ad_name_full else ad_name_full
+            
             ads_data.append({
-                "ad_name": ad['ad_name'],
+                "ad_name": ad_name_clean,  # Send clean name for Notion matching
                 "ad_id": ad['ad_id'],
                 "adset_id": ad['adset_id'],
                 "campaign_id": ad['campaign_id'],
