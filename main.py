@@ -9,11 +9,10 @@ Standalone service that:
 3. Sends to Make.com webhook
 4. Records attempt result in launches_v2_processed (UPSERT)
 
-IMPORTANT BEHAVIOR (new):
-- We do NOT filter launches_v2 by launches_v2_processed anymore.
-- That means every poll will send the selected launches_v2 rows to the webhook,
-  even if they were previously sent.
-- launches_v2_processed becomes a "last attempt status" table.
+IMPORTANT BEHAVIOR:
+- Only processes ads that haven't been successfully processed yet
+- Re-processes failed attempts after configured retry interval
+- Prevents unnecessary API calls by filtering out successfully processed ads
 
 Deploy as independent Railway service.
 """
@@ -109,8 +108,8 @@ def init_processed_table():
 # -----------------------------
 def get_ads_from_launches_v2(limit: int = 100) -> List[Dict]:
     """
-    Get ads from launches_v2 (NO processed-filtering).
-    This is the core change: we poll the "current truth" and send every run.
+    Get ads from launches_v2 that haven't been successfully processed yet.
+    Excludes ads that are already in launches_v2_processed with 'success' status.
     """
     try:
         import psycopg2
@@ -129,7 +128,9 @@ def get_ads_from_launches_v2(limit: int = 100) -> List[Dict]:
                     l.creative_id,
                     l.ad_id
                 FROM launches_v2 l
+                LEFT JOIN launches_v2_processed p ON l.launch_key = p.launch_key
                 WHERE l.created_at > NOW() - (%s * INTERVAL '1 minute')
+                  AND (p.launch_key IS NULL OR p.webhook_status = 'failed')
                 ORDER BY l.created_at DESC
                 LIMIT %s
                 """,
@@ -145,6 +146,8 @@ def get_ads_from_launches_v2(limit: int = 100) -> List[Dict]:
                     l.creative_id,
                     l.ad_id
                 FROM launches_v2 l
+                LEFT JOIN launches_v2_processed p ON l.launch_key = p.launch_key
+                WHERE p.launch_key IS NULL OR p.webhook_status = 'failed'
                 ORDER BY l.created_at DESC
                 LIMIT %s
                 """,
@@ -402,7 +405,7 @@ def main():
     if RECENT_WINDOW_MINUTES_INT is not None:
         logging.info(f"🕒 Recent window: last {RECENT_WINDOW_MINUTES_INT} minute(s)")
     else:
-        logging.info("🕒 Recent window: disabled (will resend latest rows each poll)")
+        logging.info("🕒 Recent window: disabled (processes all unprocessed ads)")
 
     logging.info("=" * 70)
 
@@ -417,15 +420,16 @@ def main():
                 ok, ads_with_names = send_to_webhook(failed, retry=True)
                 upsert_processed_rows(ads_with_names, "success" if ok else "failed")
 
-            # 2) Poll launches_v2 (NO processed filtering)
+            # 2) Poll launches_v2 (now with processed filtering)
             ads = get_ads_from_launches_v2(BATCH_SIZE)
 
             if not ads:
-                logging.info("✨ No ads found in launches_v2 to process")
+                logging.info("✨ No new ads to process")
                 logging.info(f"💤 Sleeping {POLL_INTERVAL}s until next poll...")
                 time.sleep(POLL_INTERVAL)
                 continue
 
+            logging.info(f"📋 Found {len(ads)} new ad(s) to process")
             ok, ads_with_names = send_to_webhook(ads, retry=False)
             upsert_processed_rows(ads_with_names, "success" if ok else "failed")
 
